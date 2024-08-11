@@ -6,7 +6,7 @@
 {title:Title}
 
 {phang}
-{bf:mvpoisrando} {hline 2} Multivariable Poisson Random Effects Analysis
+{bf:mvpoisrando} {hline 2} Multivar Poisson Random Effects Analysis - for PCSF SPN cohort
 
 {marker syntax}{...}
 {title:Syntax}

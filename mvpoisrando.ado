@@ -1,32 +1,40 @@
+capture program drop mvpoisrando
 program define mvpoisrando
-    syntax, site(string) randomopt(string) [poisopt(string) temp(string) covars(string asis) decimals(integer 1) pdecimals(integer 2)]
+    version 18.0
+    st_is 2 analysis
+    
+    syntax varlist(min=1), site(string) RANDOmopt(string) [poisopt(string) temp(string) DECimals(integer 1) PDECimals(integer 2) output(string)]
     
     // Check if site is specified
     if "`site'" == "" {
-        di as error "Error: A SPN tumour site must be specified in the site option."
-        exit 198
+        error 198
+        di as error "A SPN tumour site must be specified in the site option."
     }
 
     // Check if random effect is specified
     if "`randomopt'" == "" {
-        di as error "Error: Random effect must be specified in the randomopt option."
-        exit 198
+        error 198
+        di as error "Random effect must be specified in the randomopt option."
     }
 
     // Set default values if not provided
     if "`temp'" == "" {
         local temp "$temp"
     }
-    if "`covars'" == "" {
-        di as error "Error: At least one covariate must be specified in the covars option."
-        exit 198
+    
+    // Set output file path
+    if "`output'" == "" {
+        local outputfile "`temp'/x-mvpcsf-randomeffect_`site'.xls"
+    }
+    else {
+        local outputfile "`output'"
     }
 
     // Check if random effect is specified as a covariate
     foreach var of local randomopt {
-        if strpos(" `covars' ", " `var' ") > 0 {
-            di as error "Error: The random effect variable (`var') cannot be included as a covariate."
-            exit 198
+        if strpos(" `varlist' ", " `var' ") > 0 {
+            error 198
+            di as error "The random effect variable (`var') cannot be included in the varlist."
         }
     }
 
@@ -34,8 +42,8 @@ program define mvpoisrando
     foreach var in _st _t _t0 _d {
         capture confirm variable `var'
         if _rc {
+            error 198
             di as error "Required variable `var' not found. Please ensure you have run stset before using this program."
-            exit 198
         }
     }
 
@@ -43,25 +51,16 @@ program define mvpoisrando
     foreach var in rate_`site' {
         capture confirm variable `var'
         if _rc {
+            error 198
             di as error "Required variable `var' not found in the dataset."
-            exit 198
-        }
-    }
-
-    // Check for specified covariables
-    foreach var of local covars {
-        capture confirm variable `var'
-        if _rc {
-            di as error "Specified covariate `var' not found in the dataset."
-            exit 198
         }
     }
 
     // Check if data is in memory
     quietly count
     if r(N) == 0 {
+        error 2000
         di as error "No observations in memory. Please ensure your dataset is not empty."
-        exit 2000
     }
 
     preserve
@@ -73,52 +72,95 @@ program define mvpoisrando
     gen double `y' = `pyrs'/10000
     
     //collapse data
-    collapse (sum) _d `E' `y', by(`covars' `randomopt')
+    collapse (sum) _d `E' `y', by(`varlist' `randomopt')
+	
+    *-------------------------------------------------------------------------------------
+    * CHECK FOR OVERDISPERSION
+    *-------------------------------------------------------------------------------------	
+	local options exposure(`E') eform link(log) || `randomopt': 
+	
+	//run Poisson model first 
+	meglm _d i.(`varlist')  if `E'!=0 , `options', family(poisson)
+	scalar lrpois =  e(ll)
+	
+	// Fit negative binomial model
+    meglm _d i.(`varlist')  if `E'!=0 , `options', family(nbinomial)
+	scalar lrnbreg =  e(ll)
+	
+	scalar lr = -2*(lrpois-lrnbreg) 
+	di chiprob(1,lr)/2		
+	cap: assert (chiprob(1,lr)/2) < 0.05 //if true, then NB
+	 
+	if !_rc {
+		di "NEGATIVE BINOMIAL"
+		local family nbinomial 
+		}
 
-    *-----------------------------------------------------------------------------------------
+	else {
+		di "POISSON"
+		local family poisson
+		}
+
+
+    *-------------------------------------------------------------------------------------
     * LOOP OVER COLLAPSED VARIABLES 
-    *-----------------------------------------------------------------------------------------
+    *-------------------------------------------------------------------------------------
     local append replace
-    foreach depvar of local covars { 
+	local i = 0
+    foreach depvar of local varlist { 
 
         *---------------------------------------------------------------------------
-        * CREATE DUMMY VARIABLES FOR VARIABLE OF INTEREST
+        * MODELS
         *---------------------------------------------------------------------------
-        local omit`depvar' : subinstr local covars "`depvar'" ""  //remove local
-        
-        local options exposure(`E') eform link(log) || `randomopt': ,family(poisson)
-        
+        local omit`depvar' : subinstr local varlist "`depvar'" ""  //remove local
+          
         // Multivariable model
-        _eststo m1: meglm _d i.(`omit`depvar'') i.(`depvar')  if `E'!=0 , `options'
+        _eststo m1: meglm _d i.(`omit`depvar'') i.(`depvar')  if `E'!=0 , `options' , family(`family')
         
         //p-hetero
-        _eststo m0: meglm _d i.(`omit`depvar'')               if `E'!=0 & !mi(`depvar'), `options'
+        _eststo m0: meglm _d i.(`omit`depvar'')               if `E'!=0 & !mi(`depvar'), `options' , family(`family')
         lrtest m0 m1
         estadd scalar p_het = r(p) : m1 //save p-value in scalar    
 
         //p-trend
-        _eststo m2: meglm _d i.(`omit`depvar'') `depvar'      if `E'!=0 , `options'
+        _eststo m2: meglm _d i.(`omit`depvar'') `depvar'      if `E'!=0 , `options' , family(`family')
         lrtest m2 m0
         estadd scalar p_trend = r(p) : m1 //save p-value in scalar   
         estimates drop m2 m0
-		
+        
         *---------------------------------------------------------------------------
         * DEFINE ESTOUT
         *---------------------------------------------------------------------------
         local estout estout m1                                                    ///
-        using "$temp/x-mvpcsf-randomeffect_`site'.xls" ,                          ///                        
+        using "`outputfile'" ,                                                    ///                        
             cells("b(fmt(%9.`decimals'f)) & ci(par( ( - ) ) fmt(%9.`decimals'f))") eform  ///
             label collabels(, none) eqlabels(none) mlabel(, none)  labcol2(`depvar')      ///
             stats(p_trend p_het , fmt(%9.`pdecimals'f))                ///
-            refcat(`depvar'_2  ,  label(1.0 (ref.))) substitute("0.0 (0.0-.)" "-")    
+            refcat(`depvar'_2  ,  label(1.0 (ref.))) substitute("0.0 (0.0-.)" "-")   ///
+			
         
         *-------------------------------------------------------------------------------
         * ESTOUT
         *-------------------------------------------------------------------------------
-        `estout' keep(*`depvar'*)  `append' 
-        local append  append
+        if `i'==0 `estout' keep(*`depvar'*) title(`family')  replace
+		if `i'>0 `estout' keep(*`depvar'*)  append
+		local i =1
         estimates clear
     }
     
+    di as text "Results saved to: `outputfile'"
     restore //restore to original dataset
 end
+
+
+
+
+
+
+
+
+
+
+
+
+
